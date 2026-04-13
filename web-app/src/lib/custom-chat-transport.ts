@@ -174,9 +174,8 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
   }
 
   /**
-   * Refresh tools based on current state
-   * Reloads both RAG and MCP tools and merges them
-   * Filters out disabled tools based on thread settings
+   * Refresh tools based on current state.
+   * Reloads both RAG and MCP tools and merges them, filtering out disabled tools.
    * @private
    */
   async refreshTools(abortSignal?: AbortSignal) {
@@ -185,137 +184,164 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
       return
     }
 
+    const selectedModel = useModelProvider.getState().selectedModel
+    const modelSupportsTools =
+      selectedModel?.capabilities?.includes('tools') ?? this.modelSupportsTools
+
+    if (!modelSupportsTools) {
+      this.tools = {}
+      return
+    }
+
+    const disabledToolKeys = this.getDisabledToolKeys()
+    const isToolDisabled = (serverName: string, toolName: string): boolean =>
+      disabledToolKeys.includes(`${serverName}::${toolName}`)
+
     const toolsRecord: Record<string, Tool> = {}
 
-    // Get disabled tools for this thread
-    const getDisabledToolsForThread =
-      useToolAvailable.getState().getDisabledToolsForThread
-    const disabledToolKeys = this.threadId
-      ? getDisabledToolsForThread(this.threadId)
-      : useToolAvailable.getState().getDefaultDisabledTools()
-    // Helper to check if a tool is disabled
-    const isToolDisabled = (serverName: string, toolName: string): boolean => {
-      const toolKey = `${serverName}::${toolName}`
-      return disabledToolKeys.includes(toolKey)
-    }
-
-    const selectedModel = useModelProvider.getState().selectedModel
-    const modelSupportsTools = selectedModel?.capabilities?.includes('tools') ?? this.modelSupportsTools
-
-    // Only load tools if model supports them
-    if (modelSupportsTools) {
-      let hasDocuments = this.hasDocuments
-      let ragFeatureAvailable = this.ragFeatureAvailable
-
-      if (!hasDocuments && this.threadId) {
-        const thread = useThreads.getState().threads[this.threadId]
-        const hasThreadDocuments = Boolean(thread?.metadata?.hasDocuments)
-
-        const projectId = thread?.metadata?.project?.id
-        if (projectId) {
-          try {
-            const ext = ExtensionManager.getInstance().get<VectorDBExtension>(
-              ExtensionTypeEnum.VectorDB
-            )
-            if (ext?.listAttachmentsForProject) {
-              const projectFiles = await ext.listAttachmentsForProject(projectId)
-              hasDocuments = hasThreadDocuments || projectFiles.length > 0
-            }
-          } catch (error) {
-            console.warn('Failed to check project files:', error)
-            hasDocuments = hasThreadDocuments
-          }
-        } else {
-          hasDocuments = hasThreadDocuments
-        }
-      }
-
-      if (!ragFeatureAvailable) {
-        ragFeatureAvailable = Boolean(useAttachments.getState().enabled)
-      }
-
-      // Load RAG tools if documents are available
-      if (hasDocuments && ragFeatureAvailable) {
-        try {
-          const ragTools = await this.serviceHub.rag().getTools()
-          if (Array.isArray(ragTools) && ragTools.length > 0) {
-            // Convert RAG tools to AI SDK format, filtering out disabled tools
-            ragTools.forEach((tool) => {
-              // RAG tools use MCPTool interface with server field
-              const serverName =
-                (tool as { server?: string }).server || 'unknown'
-              if (!isToolDisabled(serverName, tool.name)) {
-                toolsRecord[tool.name] = {
-                  description: tool.description,
-                  inputSchema: jsonSchema(
-                    tool.inputSchema as Record<string, unknown>
-                  ),
-                } as Tool
-              }
-            })
-          }
-        } catch (error) {
-          console.warn('Failed to load RAG tools:', error)
-        }
-      }
-
-      // Load MCP tools — route through the orchestrator when available so only
-      // relevant servers are queried instead of all of them.
-      try {
-        const mcpService = this.serviceHub.mcp()
-        let mcpTools: MCPTool[]
-        const mcpSettings = useMCPServers.getState().settings
-        const routingEnabled = mcpSettings.enableSmartToolRouting
-
-        if (
-          routingEnabled &&
-          mcpService.getToolsForServers &&
-          mcpService.getServerSummaries
-        ) {
-          const routerModel =
-            mcpSettings.useLightweightRouterModel &&
-            mcpSettings.routerModelProvider.trim() &&
-            mcpSettings.routerModelId.trim()
-              ? (await this.resolveRouterModel(mcpSettings)) ?? this.model
-              : this.model
-          mcpTools = await mcpOrchestrator.getRelevantTools(
-            this.lastUserMessage,
-            {
-              getTools: () => mcpService.getTools(),
-              getToolsForServers: (names) =>
-                mcpService.getToolsForServers!(names),
-              getServerSummaries: () => mcpService.getServerSummaries!(),
-            },
-            disabledToolKeys,
-            {
-              routerModel,
-              abortSignal,
-            }
-          )
-        } else {
-          mcpTools = await mcpService.getTools()
-        }
-
-        if (Array.isArray(mcpTools) && mcpTools.length > 0) {
-          // MCP tools added after RAG tools, so they take precedence on name conflicts
-          mcpTools.forEach((tool) => {
-            const serverName = tool.server || 'unknown'
-            if (!isToolDisabled(serverName, tool.name)) {
-              toolsRecord[tool.name] = {
-                description: tool.description,
-                inputSchema: jsonSchema(
-                  tool.inputSchema as Record<string, unknown>
-                ),
-              } as Tool
-            }
-          })
-        }
-      } catch (error) {
-        console.warn('Failed to load MCP tools:', error)
-      }
-    }
+    await this.loadRagTools(toolsRecord, isToolDisabled)
+    await this.loadMcpTools(toolsRecord, isToolDisabled, disabledToolKeys, abortSignal)
 
     this.tools = toolsRecord
+  }
+
+  /**
+   * Get the list of disabled tool keys for the current thread.
+   */
+  private getDisabledToolKeys(): string[] {
+    return this.threadId
+      ? useToolAvailable.getState().getDisabledToolsForThread(this.threadId)
+      : useToolAvailable.getState().getDefaultDisabledTools()
+  }
+
+  /**
+   * Check whether the current thread has documents available for RAG.
+   */
+  private async checkDocumentAvailability(): Promise<boolean> {
+    if (this.hasDocuments) return true
+    if (!this.threadId) return false
+
+    const thread = useThreads.getState().threads[this.threadId]
+    const hasThreadDocuments = Boolean(thread?.metadata?.hasDocuments)
+
+    const projectId = thread?.metadata?.project?.id
+    if (!projectId) return hasThreadDocuments
+
+    try {
+      const ext = ExtensionManager.getInstance().get<VectorDBExtension>(
+        ExtensionTypeEnum.VectorDB
+      )
+      if (ext?.listAttachmentsForProject) {
+        const projectFiles = await ext.listAttachmentsForProject(projectId)
+        return hasThreadDocuments || projectFiles.length > 0
+      }
+    } catch (error) {
+      console.warn('Failed to check project files:', error)
+    }
+    return hasThreadDocuments
+  }
+
+  /**
+   * Load RAG tools into the tools record if documents are available.
+   */
+  private async loadRagTools(
+    toolsRecord: Record<string, Tool>,
+    isToolDisabled: (serverName: string, toolName: string) => boolean
+  ) {
+    const hasDocuments = await this.checkDocumentAvailability()
+    const ragFeatureAvailable =
+      this.ragFeatureAvailable || Boolean(useAttachments.getState().enabled)
+
+    if (!hasDocuments || !ragFeatureAvailable) return
+
+    try {
+      const ragTools = await this.serviceHub!.rag().getTools()
+      if (!Array.isArray(ragTools)) return
+
+      for (const tool of ragTools) {
+        const serverName = (tool as { server?: string }).server || 'unknown'
+        if (!isToolDisabled(serverName, tool.name)) {
+          toolsRecord[tool.name] = {
+            description: tool.description,
+            inputSchema: jsonSchema(tool.inputSchema as Record<string, unknown>),
+          } as Tool
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to load RAG tools:', error)
+    }
+  }
+
+  /**
+   * Load MCP tools into the tools record, routing through the orchestrator
+   * when smart routing is available.
+   */
+  private async loadMcpTools(
+    toolsRecord: Record<string, Tool>,
+    isToolDisabled: (serverName: string, toolName: string) => boolean,
+    disabledToolKeys: string[],
+    abortSignal?: AbortSignal
+  ) {
+    try {
+      const mcpService = this.serviceHub!.mcp()
+      const mcpSettings = useMCPServers.getState().settings
+
+      const mcpTools = await this.fetchMcpTools(
+        mcpService, mcpSettings, disabledToolKeys, abortSignal
+      )
+
+      if (!Array.isArray(mcpTools)) return
+
+      for (const tool of mcpTools) {
+        const serverName = tool.server || 'unknown'
+        if (!isToolDisabled(serverName, tool.name)) {
+          toolsRecord[tool.name] = {
+            description: tool.description,
+            inputSchema: jsonSchema(tool.inputSchema as Record<string, unknown>),
+          } as Tool
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to load MCP tools:', error)
+    }
+  }
+
+  /**
+   * Fetch MCP tools, using the orchestrator for smart routing when enabled.
+   */
+  private async fetchMcpTools(
+    mcpService: ReturnType<ServiceHub['mcp']>,
+    mcpSettings: ReturnType<typeof useMCPServers.getState>['settings'],
+    disabledToolKeys: string[],
+    abortSignal?: AbortSignal
+  ): Promise<MCPTool[]> {
+    const routingEnabled = mcpSettings.enableSmartToolRouting
+
+    if (
+      !routingEnabled ||
+      !mcpService.getToolsForServers ||
+      !mcpService.getServerSummaries
+    ) {
+      return mcpService.getTools()
+    }
+
+    const routerModel =
+      mcpSettings.useLightweightRouterModel &&
+      mcpSettings.routerModelProvider.trim() &&
+      mcpSettings.routerModelId.trim()
+        ? (await this.resolveRouterModel(mcpSettings)) ?? this.model
+        : this.model
+
+    return mcpOrchestrator.getRelevantTools(
+      this.lastUserMessage,
+      {
+        getTools: () => mcpService.getTools(),
+        getToolsForServers: (names) => mcpService.getToolsForServers!(names),
+        getServerSummaries: () => mcpService.getServerSummaries!(),
+      },
+      disabledToolKeys,
+      { routerModel, abortSignal }
+    )
   }
 
   private async resolveRouterModel(settings: {
@@ -390,175 +416,25 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
       messageId: string | undefined
     } & ChatRequestOptions
   ): Promise<ReadableStream<UIMessageChunk>> {
-    // Capture the effective provider name early so the Anthropic serial
-    // tool-use repair later uses the same value that was used to create the
-    // model, even if the user switches provider mid-request.
-    const modelId = useModelProvider.getState().selectedModel?.id
-    const providerId = useModelProvider.getState().selectedProvider
-    const effectiveProviderName = providerId
-    const provider = useModelProvider.getState().getProviderByName(providerId)
-    if (!this.serviceHub || !modelId || !provider) {
-      throw new Error('ServiceHub not initialized or model/provider missing.')
-    }
+    const { provider, providerId, modelId } = this.resolveModelAndProvider()
 
     this.lastUserMessage = extractLatestUserText(options.messages)
-
-    try {
-      const updatedProvider = useModelProvider
-        .getState()
-        .getProviderByName(providerId)
-
-      const currentAssistant = useAssistant.getState().currentAssistant
-      const inferenceParams = currentAssistant?.parameters
-
-      // Create the model before refreshing tools so the MCP orchestrator can run
-      // structured LLM routing when many servers are connected.
-      this.model = await ModelFactory.createModel(
-        modelId,
-        updatedProvider ?? provider,
-        inferenceParams ?? {}
-      )
-    } catch (error) {
-      console.error('Failed to create model:', error)
-      throw new Error(
-        `Failed to create model: ${error instanceof Error ? error.message : JSON.stringify(error)}`
-      )
-    }
-
+    await this.initModel(modelId, providerId, provider)
     await this.refreshTools(options.abortSignal)
 
-    // Fix for Anthropic serial tool-use (error 400): when an assistant message
-    // contains tool parts interleaved with text parts (serial tool calls),
-    // split it into separate messages so convertToModelMessages produces the
-    // tool_use / tool_result pairing that the Claude API requires.
-    // See: https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use#parallel-tool-use
-    const messagesToConvert = (() => {
-      if (effectiveProviderName !== 'anthropic') {
-        return options.messages
-      }
-      return options.messages.flatMap((message) => {
-        if (message.role !== 'assistant') return [message]
-
-        const parts = Array.isArray(message.parts) ? message.parts : []
-        if (parts.length === 0) return [message]
-
-        const isToolPart = (p: (typeof parts)[number]) =>
-          p.type.startsWith('tool-')
-
-        const waves: (typeof parts)[] = []
-        let currentWave: typeof parts = []
-        let seenToolParts = false
-
-        for (const part of parts) {
-          if (isToolPart(part)) {
-            seenToolParts = true
-            currentWave.push(part)
-          } else if (!isToolPart(part) && seenToolParts) {
-            // Any non-tool part (text, reasoning, file, etc.) after tool parts
-            // marks the start of a new wave
-            waves.push(currentWave)
-            currentWave = [part]
-            seenToolParts = false
-          } else {
-            currentWave.push(part)
-          }
-        }
-        if (currentWave.length > 0) waves.push(currentWave)
-
-        // No serial tool calls detected — return original message unchanged
-        if (waves.length <= 1) return [message]
-
-        return waves.map((waveParts, i) => ({
-          ...message,
-          id: `${message.id}_w${i}`,
-          parts: waveParts,
-        }))
-      })
-    })()
-
     const inferenceParams = useAssistant.getState().currentAssistant?.parameters ?? {}
+    const maxOutputTokens = this.parseMaxOutputTokens(inferenceParams)
 
-    const selectedModel = useModelProvider.getState().selectedModel
-
-    const maxOutputTokens: number | undefined = (() => {
-      const raw = inferenceParams.max_output_tokens ?? inferenceParams.max_tokens
-      if (raw === undefined || raw === null) return undefined
-      const n = typeof raw === 'number' ? raw : Number(raw)
-      return isNaN(n) ? undefined : n
-    })()
-
-    const maxContextTokens = (() => {
-      const raw = inferenceParams.max_context_tokens
-      return typeof raw === 'number' ? raw : (Number(raw) || 0)
-    })()
-    const autoCompact =
-      inferenceParams.auto_compact === true ||
-      inferenceParams.auto_compact === 'true'
-
-    // Auto-trim or auto-compact conversation history when max_context_tokens is configured
-    let effectiveMessages = messagesToConvert
-    if (maxContextTokens > 0) {
-      const contextConfig: ContextManagerConfig = {
-        maxContextTokens,
-        maxOutputTokens: maxOutputTokens ?? 2048,
-        autoCompact: !!autoCompact,
-      }
-
-      const systemPromptTokens = this.systemMessage
-        ? estimateTokens(this.systemMessage) + 4
-        : 0
-
-      if (autoCompact && this.model) {
-        const compactResult = await compactMessages(
-          messagesToConvert,
-          contextConfig,
-          this.model,
-          systemPromptTokens
-        )
-        effectiveMessages = compactResult.messages
-        if (compactResult.trimmedCount > 0) {
-          console.debug(
-            `[context-manager] Compacted ${compactResult.trimmedCount} messages` +
-              (compactResult.compactedSummary ? ' with summary' : ' (trim fallback)')
-          )
-        }
-      } else {
-        const trimResult = trimMessages(
-          messagesToConvert,
-          contextConfig,
-          systemPromptTokens
-        )
-        effectiveMessages = trimResult.messages
-        if (trimResult.trimmedCount > 0) {
-          console.debug(
-            `[context-manager] Trimmed ${trimResult.trimmedCount} oldest messages to fit context budget`
-          )
-        }
-      }
-    }
-
-    const baseMessages = convertToModelMessages(
-      this.mapUserInlineAttachments(effectiveMessages)
+    const messagesToConvert = this.splitAnthropicSerialToolCalls(options.messages, providerId)
+    const effectiveMessages = await this.applyContextManagement(
+      messagesToConvert, inferenceParams, maxOutputTokens
     )
 
-    // If continuing a truncated response, append the partial assistant content as a
-    // prefill so the model resumes from where it left off rather than regenerating.
-    const continueContent = this.continueFromContent
-    this.continueFromContent = null
-    const modelMessages = continueContent
-      ? [...baseMessages, { role: 'assistant' as const, content: continueContent }]
-      : baseMessages
-
-    // Include tools only if we have tools loaded AND model supports them
-    const hasTools = Object.keys(this.tools).length > 0
-    const modelSupportsTools = selectedModel?.capabilities?.includes('tools') ?? this.modelSupportsTools
-    const shouldEnableTools = hasTools && modelSupportsTools
-
-    // Track stream timing and token count for token speed calculation
-    let streamStartTime: number | undefined
+    const { modelMessages, continueContent } = this.buildModelMessages(effectiveMessages)
+    const shouldEnableTools = this.shouldEnableTools()
 
     const result = streamText({
-      model: this.model,
+      model: this.model!,
       messages: modelMessages,
       abortSignal: options.abortSignal,
       tools: shouldEnableTools ? this.tools : undefined,
@@ -567,11 +443,208 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
       ...(maxOutputTokens !== undefined ? { maxTokens: maxOutputTokens } : {}),
     })
 
+    const uiStream = this.createUIMessageStream(result)
+
+    return continueContent
+      ? prependTextDeltaToUIStream(uiStream, continueContent)
+      : uiStream
+  }
+
+  /**
+   * Resolve and validate the current model, provider ID, and provider instance.
+   */
+  private resolveModelAndProvider() {
+    const modelId = useModelProvider.getState().selectedModel?.id
+    const providerId = useModelProvider.getState().selectedProvider
+    const provider = useModelProvider.getState().getProviderByName(providerId)
+    if (!this.serviceHub || !modelId || !provider) {
+      throw new Error('ServiceHub not initialized or model/provider missing.')
+    }
+    return { provider, providerId, modelId }
+  }
+
+  /**
+   * Create the LanguageModel instance for the current request.
+   */
+  private async initModel(
+    modelId: string,
+    providerId: string,
+    fallbackProvider: NonNullable<ReturnType<ReturnType<typeof useModelProvider.getState>['getProviderByName']>>
+  ) {
+    try {
+      const updatedProvider = useModelProvider.getState().getProviderByName(providerId)
+      const inferenceParams = useAssistant.getState().currentAssistant?.parameters
+      this.model = await ModelFactory.createModel(
+        modelId,
+        updatedProvider ?? fallbackProvider,
+        inferenceParams ?? {}
+      )
+    } catch (error) {
+      console.error('Failed to create model:', error)
+      throw new Error(
+        `Failed to create model: ${error instanceof Error ? error.message : JSON.stringify(error)}`
+      )
+    }
+  }
+
+  /**
+   * Parse max_output_tokens / max_tokens from inference parameters.
+   */
+  private parseMaxOutputTokens(
+    inferenceParams: Record<string, unknown>
+  ): number | undefined {
+    const raw = inferenceParams.max_output_tokens ?? inferenceParams.max_tokens
+    if (raw === undefined || raw === null) return undefined
+    const n = typeof raw === 'number' ? raw : Number(raw)
+    return isNaN(n) ? undefined : n
+  }
+
+  /**
+   * Fix for Anthropic serial tool-use (error 400): when an assistant message
+   * contains tool parts interleaved with text parts, split it into separate
+   * messages so convertToModelMessages produces the tool_use / tool_result
+   * pairing that the Claude API requires.
+   * See: https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use#parallel-tool-use
+   */
+  private splitAnthropicSerialToolCalls(
+    messages: UIMessage[],
+    providerName: string
+  ): UIMessage[] {
+    if (providerName !== 'anthropic') return messages
+
+    return messages.flatMap((message) => {
+      if (message.role !== 'assistant') return [message]
+
+      const parts = Array.isArray(message.parts) ? message.parts : []
+      if (parts.length === 0) return [message]
+
+      const isToolPart = (p: (typeof parts)[number]) =>
+        p.type.startsWith('tool-')
+
+      const waves: (typeof parts)[] = []
+      let currentWave: typeof parts = []
+      let seenToolParts = false
+
+      for (const part of parts) {
+        if (isToolPart(part)) {
+          seenToolParts = true
+          currentWave.push(part)
+        } else if (!isToolPart(part) && seenToolParts) {
+          waves.push(currentWave)
+          currentWave = [part]
+          seenToolParts = false
+        } else {
+          currentWave.push(part)
+        }
+      }
+      if (currentWave.length > 0) waves.push(currentWave)
+
+      if (waves.length <= 1) return [message]
+
+      return waves.map((waveParts, i) => ({
+        ...message,
+        id: `${message.id}_w${i}`,
+        parts: waveParts,
+      }))
+    })
+  }
+
+  /**
+   * Auto-trim or auto-compact conversation history when max_context_tokens
+   * is configured.
+   */
+  private async applyContextManagement(
+    messages: UIMessage[],
+    inferenceParams: Record<string, unknown>,
+    maxOutputTokens: number | undefined
+  ): Promise<UIMessage[]> {
+    const maxContextTokens = (() => {
+      const raw = inferenceParams.max_context_tokens
+      return typeof raw === 'number' ? raw : (Number(raw) || 0)
+    })()
+
+    if (maxContextTokens <= 0) return messages
+
+    const autoCompact =
+      inferenceParams.auto_compact === true ||
+      inferenceParams.auto_compact === 'true'
+
+    const contextConfig: ContextManagerConfig = {
+      maxContextTokens,
+      maxOutputTokens: maxOutputTokens ?? 2048,
+      autoCompact: !!autoCompact,
+    }
+
+    const systemPromptTokens = this.systemMessage
+      ? estimateTokens(this.systemMessage) + 4
+      : 0
+
+    if (autoCompact && this.model) {
+      const compactResult = await compactMessages(
+        messages,
+        contextConfig,
+        this.model,
+        systemPromptTokens
+      )
+      if (compactResult.trimmedCount > 0) {
+        console.debug(
+          `[context-manager] Compacted ${compactResult.trimmedCount} messages` +
+            (compactResult.compactedSummary ? ' with summary' : ' (trim fallback)')
+        )
+      }
+      return compactResult.messages
+    }
+
+    const trimResult = trimMessages(messages, contextConfig, systemPromptTokens)
+    if (trimResult.trimmedCount > 0) {
+      console.debug(
+        `[context-manager] Trimmed ${trimResult.trimmedCount} oldest messages to fit context budget`
+      )
+    }
+    return trimResult.messages
+  }
+
+  /**
+   * Convert UI messages to model messages, applying inline attachments and
+   * continue-from-content prefill.
+   */
+  private buildModelMessages(effectiveMessages: UIMessage[]) {
+    const baseMessages = convertToModelMessages(
+      this.mapUserInlineAttachments(effectiveMessages)
+    )
+
+    const continueContent = this.continueFromContent
+    this.continueFromContent = null
+
+    const modelMessages = continueContent
+      ? [...baseMessages, { role: 'assistant' as const, content: continueContent }]
+      : baseMessages
+
+    return { modelMessages, continueContent }
+  }
+
+  /**
+   * Determine whether tools should be passed to the model.
+   */
+  private shouldEnableTools(): boolean {
+    const hasTools = Object.keys(this.tools).length > 0
+    const selectedModel = useModelProvider.getState().selectedModel
+    const modelSupportsTools =
+      selectedModel?.capabilities?.includes('tools') ?? this.modelSupportsTools
+    return hasTools && modelSupportsTools
+  }
+
+  /**
+   * Create the UI message stream with token usage tracking and metadata.
+   */
+  private createUIMessageStream(
+    result: ReturnType<typeof streamText>
+  ): ReadableStream<UIMessageChunk> {
+    let streamStartTime: number | undefined
     let tokensPerSecond = 0
 
-    const uiStream = result.toUIMessageStream({
+    return result.toUIMessageStream({
       messageMetadata: ({ part }) => {
-        // Track stream start time on start
         if (part.type === 'start' && !streamStartTime) {
           streamStartTime = Date.now()
         }
@@ -582,61 +655,27 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
               ?.tokensPerSecond as number) || 0
         }
 
-        // Add usage and token speed to metadata on finish
         if (part.type === 'finish') {
-          const finishPart = part as {
-            type: 'finish'
-            totalUsage: LanguageModelUsage
-            finishReason: string
-          }
-          const usage = finishPart.totalUsage
-          const durationMs = streamStartTime ? Date.now() - streamStartTime : 0
-          const durationSec = durationMs / 1000
-
-          // Use provider's outputTokens, or llama.cpp completionTokens, or fall back to text delta count
-          const outputTokens = usage?.outputTokens ?? 0
-          const inputTokens = usage?.inputTokens
-
-          // Use llama.cpp's tokens per second if available, otherwise calculate from duration
-          let tokenSpeed: number
-          if (durationSec > 0 && outputTokens > 0) {
-            tokenSpeed =
-              tokensPerSecond > 0 ? tokensPerSecond : outputTokens / durationSec
-          } else {
-            tokenSpeed = 0
-          }
-
-          return {
-            finishReason: finishPart.finishReason,
-            usage: {
-              inputTokens: inputTokens,
-              outputTokens: outputTokens,
-              totalTokens:
-                usage?.totalTokens ?? (inputTokens ?? 0) + outputTokens,
+          return this.buildFinishMetadata(
+            part as {
+              type: 'finish'
+              totalUsage: LanguageModelUsage
+              finishReason: string
             },
-            tokenSpeed: {
-              tokenSpeed: Math.round(tokenSpeed * 10) / 10, // Round to 1 decimal
-              tokenCount: outputTokens,
-              durationMs,
-            },
-          }
+            streamStartTime,
+            tokensPerSecond
+          )
         }
 
         return undefined
       },
       onError: (error) => {
-        const errorMessage = error == null
-          ? 'Unknown error'
-          : typeof error === 'string'
-            ? error
-            : error instanceof Error
-              ? error.message
-              : JSON.stringify(error)
-
-        return errorMessage
+        if (error == null) return 'Unknown error'
+        if (typeof error === 'string') return error
+        if (error instanceof Error) return error.message
+        return JSON.stringify(error)
       },
       onFinish: ({ responseMessage }) => {
-        // Call the token usage callback with usage data when stream completes
         if (responseMessage) {
           const metadata = responseMessage.metadata as
             | Record<string, unknown>
@@ -648,15 +687,48 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
         }
       },
     })
+  }
 
-    // When continuing a truncated response, inject the partial content as the
-    // very first text-delta so the new message immediately shows it and the
-    // user sees a seamless continuation rather than an empty box.
-    const finalStream = continueContent
-      ? prependTextDeltaToUIStream(uiStream, continueContent)
-      : uiStream
+  /**
+   * Build the metadata object returned on stream finish (usage + token speed).
+   */
+  private buildFinishMetadata(
+    finishPart: {
+      type: 'finish'
+      totalUsage: LanguageModelUsage
+      finishReason: string
+    },
+    streamStartTime: number | undefined,
+    tokensPerSecond: number
+  ) {
+    const usage = finishPart.totalUsage
+    const durationMs = streamStartTime ? Date.now() - streamStartTime : 0
+    const durationSec = durationMs / 1000
 
-    return finalStream
+    const outputTokens = usage?.outputTokens ?? 0
+    const inputTokens = usage?.inputTokens
+
+    let tokenSpeed: number
+    if (durationSec > 0 && outputTokens > 0) {
+      tokenSpeed =
+        tokensPerSecond > 0 ? tokensPerSecond : outputTokens / durationSec
+    } else {
+      tokenSpeed = 0
+    }
+
+    return {
+      finishReason: finishPart.finishReason,
+      usage: {
+        inputTokens: inputTokens,
+        outputTokens: outputTokens,
+        totalTokens: usage?.totalTokens ?? (inputTokens ?? 0) + outputTokens,
+      },
+      tokenSpeed: {
+        tokenSpeed: Math.round(tokenSpeed * 10) / 10,
+        tokenCount: outputTokens,
+        durationMs,
+      },
+    }
   }
 
   async reconnectToStream(
